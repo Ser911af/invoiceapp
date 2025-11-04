@@ -1,305 +1,372 @@
-# app_conciliacion.py
-# -*- coding: utf-8 -*-
-import streamlit as st
-import pandas as pd
-import numpy as np
-import re
 import io
-import unicodedata
-from typing import Optional, List, Tuple
+import re
+import numpy as np
+import pandas as pd
+import streamlit as st
+from datetime import datetime
 
 # =========================
-# Config & Título
+# === UTILIDADES        ===
 # =========================
-st.set_page_config(page_title="Conciliación de Cartera (Automática)", layout="wide")
-st.title("Conciliación de Cartera: CierreCartera vs BALANCE 13452501 (Automática)")
-st.caption("App fija para este archivo: detecta columnas y concilia por clave 'piso-num' (ej. 1-9803). Sin selectores.")
 
-# =========================
-# Utilidades
-# =========================
-def normalize_text(s: str) -> str:
-    if s is None or (isinstance(s, float) and pd.isna(s)):
-        return ""
-    s = str(s)
-    s = "".join(c for c in unicodedata.normalize("NFD", s) if unicodedata.category(c) != "Mn")
-    return s.lower().strip()
+def classify_invoice(invoice):
+    s = "" if pd.isna(invoice) else str(invoice).strip()
+    sl = s.lower()
+    if "need" in sl:
+        return "need"
+    if "flag file" in sl or re.search(r"\bff\b", sl):
+        return "flag_file"
+    if re.search(r"\bok\b", sl):
+        return "ok"
+    if s == "" or re.fullmatch(r"[A-Za-z0-9_\-\/]+", s):
+        return "empty_or_number"
+    return "other"
 
-def make_unique(names: List[str]) -> List[str]:
-    seen, out = {}, []
-    for n in names:
-        n = str(n)
-        if n not in seen:
-            seen[n] = 0
-            out.append(n)
-        else:
-            seen[n] += 1
-            out.append(f"{n}_{seen[n]}")
-    return out
 
-def build_table_from_row(df_raw: pd.DataFrame, header_row_idx: int) -> pd.DataFrame:
-    headers = df_raw.iloc[header_row_idx].astype(str).tolist()
-    headers = [h if normalize_text(h) not in ("", "unnamed: 0", "nan") else f"col_{i}" for i, h in enumerate(headers)]
-    headers = make_unique(headers)
-    data = df_raw.iloc[header_row_idx+1:].copy()
-    data.columns = headers
-    data = data.dropna(how="all")
-    for c in list(data.select_dtypes(include=["object"]).columns):
-        data[c] = data[c].astype(str).str.strip()
-    return data
-
-def drop_all_empty_columns(df: pd.DataFrame) -> pd.DataFrame:
-    tmp = df.copy()
-    for c in tmp.columns:
-        if tmp[c].dtype == object:
-            tmp[c] = tmp[c].replace("", np.nan)
-    mask_nonempty = tmp.notna().any(axis=0)
-    return df.loc[:, mask_nonempty.values]
-
-def to_amount(series: pd.Series) -> pd.Series:
-    s = series.fillna("").astype(str)
-    s = s.replace({r'[^0-9\-,\.]': ''}, regex=True)
-    # ES: miles con punto, decimales con coma
-    s = s.str.replace('.', '', regex=False).str.replace(',', '.', regex=False)
-    return pd.to_numeric(s, errors='coerce')
-
-APT_SEP_REGEX = r"[-_/\.]"  # separadores aceptados: -, _, /, .
-PI_SO_NUM_PATTERN = re.compile(rf"^\s*\d+\s*{APT_SEP_REGEX}\s*\d+\s*$")  # matches completo tipo "1-9803"
-PI_SO_NUM_SEARCH = re.compile(rf"(\d+)\s*{APT_SEP_REGEX}\s*(\d+)")       # busca dentro del texto
-
-def normalize_apto_key(s: str) -> Optional[str]:
-    if pd.isna(s):
+def calculate_dias360(requested_date, ref_date):
+    """Acepta datetime/fecha/string; devuelve días 360 o None si no parsea."""
+    try:
+        if pd.isna(requested_date):
+            return None
+        requested_date = pd.to_datetime(requested_date).date()
+        diff = (
+            (ref_date.year - requested_date.year) * 360
+            + (ref_date.month - requested_date.month) * 30
+            + (ref_date.day - requested_date.day)
+        )
+        return diff
+    except Exception:
         return None
-    text = str(s).strip()
-    m = PI_SO_NUM_SEARCH.search(text)
-    if not m:
+
+
+def coerce_money_series(s):
+    if s is None:
+        return s
+    return (
+        s.astype(str)
+        .str.replace(r"[\$,]", "", regex=True)
+        .str.replace(r"\s", "", regex=True)
+        .replace({"": None})
+        .pipe(pd.to_numeric, errors="coerce")
+    )
+
+
+def extract_digits(val):
+    if pd.isna(val):
         return None
-    piso = int(m.group(1))
-    num  = int(m.group(2))
-    return f"{piso}-{num}"
+    m = re.search(r"(\d+)", str(val))
+    return m.group(1) if m else None
 
-def find_col_fuzzy(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
-    cols = list(df.columns)
-    ncols = [normalize_text(c) for c in cols]
-    best, score_best = None, -1
-    for i, nc in enumerate(ncols):
-        score = sum(kw in nc for kw in candidates)
-        if score > score_best:
-            best, score_best = cols[i], score
-    return best
 
-def pick_apto_col_by_pattern(df: pd.DataFrame) -> Optional[str]:
-    """
-    Selecciona la mejor columna que contenga valores tipo 'piso-num' (1-9803),
-    puntuando por cantidad de matches regex en las primeras filas no vacías.
-    """
-    best_col, best_hits = None, -1
-    sample_n = min(200, len(df))
-    for col in df.columns:
-        s = df[col].dropna().astype(str).head(sample_n)
-        hits = s.apply(lambda x: 1 if PI_SO_NUM_SEARCH.search(x) else 0).sum()
-        if hits > best_hits:
-            best_hits = hits
-            best_col = col
-    return best_col
+def build_salesrep_lookup(consolidated_df: pd.DataFrame):
+    dfc = consolidated_df.copy()
+    dfc.columns = dfc.columns.str.strip()
 
-def pick_amount_col(df: pd.DataFrame, prefer_keywords: List[str]) -> Optional[str]:
-    """
-    Elige columna de montos: primero por keywords, si empate/ausencia
-    escoge la columna numérica con mayor suma absoluta.
-    """
-    # 1) por keywords
-    kw_col = find_col_fuzzy(df, prefer_keywords)
-    if kw_col is not None:
-        return kw_col
-    # 2) por numéricos parseables
-    best_col, best_abs_sum = None, -1
-    for col in df.columns:
-        nums = to_amount(df[col])
-        score = np.nansum(np.abs(nums.values))
-        if np.isfinite(score) and score > best_abs_sum:
-            best_abs_sum = score
-            best_col = col
-    return best_col
+    needed_cols = {"Source", "Sales Rep"}
+    missing_cols = [c for c in needed_cols if c not in dfc.columns]
+    if missing_cols:
+        raise ValueError(f"Faltan columnas en el consolidado: {missing_cols}")
 
-# =========================
-# Parámetros fijos del caso
-# =========================
-SHEET_CIERRE = "CierreCartera"
-SHEET_BALANCE = "BALANCE 13452501"
-HDR_CIERRE_IDX = 7   # fila 8 de Excel
-HDR_BALANCE_IDX = 2  # fila 3 de Excel
-TOLERANCE_DEFAULT = 0.01
+    dfc["po_key"] = dfc["Source"].apply(extract_digits)
 
-# =========================
-# Carga de archivo
-# =========================
-uploaded = st.file_uploader("Sube tu Excel (debe contener 'CierreCartera' y 'BALANCE 13452501')", type=["xlsx"])
-if not uploaded:
-    st.info("Sube el archivo para continuar. Este flujo está fijado a esas 2 hojas y filas de encabezado.")
-    st.stop()
+    def first_non_empty(s):
+        for x in s:
+            if pd.notna(x) and str(x).strip() != "":
+                return str(x).strip()
+        return None
 
-try:
-    xls = pd.ExcelFile(uploaded)
-    sheet_names = xls.sheet_names
-    missing = [s for s in [SHEET_CIERRE, SHEET_BALANCE] if s not in sheet_names]
-    if missing:
-        st.error(f"No encuentro estas hojas requeridas: {', '.join(missing)}.\nHojas disponibles: {', '.join(sheet_names)}")
-        st.stop()
-except Exception as e:
-    st.error(f"No pude leer el Excel: {e}")
-    st.stop()
+    salesrep_map = (
+        dfc.sort_values(by=["po_key"])  # asegura orden estable
+        .groupby("po_key", dropna=True)["Sales Rep"]
+        .apply(first_non_empty)
+        .to_dict()
+    )
+    return {k: v for k, v in salesrep_map.items() if k}
 
-# Lectura cruda (sin header) y construcción directa por override
-raw1 = pd.read_excel(uploaded, sheet_name=SHEET_CIERRE, header=None, dtype=str)
-raw2 = pd.read_excel(uploaded, sheet_name=SHEET_BALANCE, header=None, dtype=str)
 
-df1 = build_table_from_row(raw1, HDR_CIERRE_IDX)
-df2 = build_table_from_row(raw2, HDR_BALANCE_IDX)
-
-# Limpieza: remover columnas totalmente vacías
-df1 = drop_all_empty_columns(df1)
-df2 = drop_all_empty_columns(df2)
-
-st.success("Hojas cargadas con override fijo.")
-with st.expander("Vista previa (Cierre)"):
-    st.dataframe(df1.head(12), use_container_width=True)
-with st.expander("Vista previa (Balance)"):
-    st.dataframe(df2.head(12), use_container_width=True)
-
-# =========================
-# Detección automática de columnas
-# =========================
-# 1) Cierre: columna piso-num (apto) y columna valor cobro
-apto_cierre_col = pick_apto_col_by_pattern(df1)
-if apto_cierre_col is None:
-    # fallback por nombre
-    apto_cierre_col = find_col_fuzzy(df1, ["apto", "apart", "nro", "numero", "inmueble"])
-valor_cobro_col = pick_amount_col(df1, ["valor cobro", "valor a cobrar", "valor cobrado", "cobro", "cuota", "facturado", "valor"])
-
-# 2) Balance: columna piso-num (puede ser NIT o Nombre NIT) y columna nuevo saldo
-apto_balance_col = pick_apto_col_by_pattern(df2)
-if apto_balance_col is None:
-    apto_balance_col = find_col_fuzzy(df2, ["nit", "nombre", "apto", "apart", "unidad", "inmueble"])
-nuevo_saldo_col = pick_amount_col(df2, ["nuevo saldo", "saldo nuevo", "saldo final", "saldo", "balance", "cartera", "deuda"])
-
-chosen = {
-    "apto_cierre_col": apto_cierre_col,
-    "valor_cobro_col": valor_cobro_col,
-    "apto_balance_col": apto_balance_col,
-    "nuevo_saldo_col": nuevo_saldo_col
-}
-
-# Validación de detección
-missing_cols = [k for k, v in chosen.items() if v is None or v not in (list(df1.columns) + list(df2.columns))]
-if any(chosen[k] is None for k in chosen):
-    st.error(f"No pude detectar todas las columnas necesarias automáticamente.\nDetecciones: {chosen}")
-    st.stop()
-
-st.info(f"Columnas detectadas automáticamente:\n- Cierre (apto): **{apto_cierre_col}**\n- Cierre (valor cobro): **{valor_cobro_col}**\n- Balance (apto): **{apto_balance_col}**\n- Balance (nuevo saldo): **{nuevo_saldo_col}**")
-
-# =========================
-# Conciliación automática
-# =========================
-tolerance = TOLERANCE_DEFAULT
-
-# Montos
-df1["_valor_cobro_num"] = to_amount(df1[valor_cobro_col])
-df2["_nuevo_saldo_num"] = to_amount(df2[nuevo_saldo_col])
-
-# =========================
-# Clave piso-num con filtrado de valores no válidos
-# =========================
-def is_valid_apto_format(s: str) -> bool:
-    """Acepta solo formatos tipo 1-9803, 2-9901, etc. (no P205, no vacíos, no 999.999-1)"""
-    if pd.isna(s):
+def _is_zero_amount(x):
+    try:
+        return np.isclose(float(x if pd.notna(x) else 0.0), 0.0)
+    except Exception:
         return False
-    text = str(s).strip()
-    # Solo acepta si es exactamente piso-num con 1 o 2 dígitos de piso y 3-5 de número
-    return bool(re.match(r"^\d{1,2}[-_/\.]\d{3,5}$", text))
 
-# Aplicar normalización y filtrar
-df1["_apto_key"] = df1[apto_cierre_col].apply(normalize_apto_key)
-df2["_apto_key"] = df2[apto_balance_col].apply(normalize_apto_key)
 
-# Filtrar out valores no válidos o vacíos
-df1 = df1[df1[apto_cierre_col].apply(is_valid_apto_format)]
-df2 = df2[df2[apto_balance_col].apply(is_valid_apto_format)]
+def _autofit_widths(worksheet, df_sheet, formats_by_col=None, min_w=9, max_w=42, pad=2, ratio=1.1):
+    """Ajusta anchos de columnas al contenido aproximando número de caracteres."""
+    for col_name in df_sheet.columns:
+        col_idx = df_sheet.columns.get_loc(col_name)
+        series = df_sheet[col_name].astype(str).replace("nan", "")
+        max_len_cells = series.map(len).max() if len(series) else 0
+        header_len = len(str(col_name))
+        width = int(max(header_len, max_len_cells) * ratio) + pad
+        width = max(min_w, min(width, max_w))
+        fmt = formats_by_col.get(col_name) if formats_by_col else None
+        worksheet.set_column(col_idx, col_idx, width, fmt)
+
 
 # =========================
-# Agregaciones
+# === APP STREAMLIT      ===
 # =========================
-g1 = (
-    df1.dropna(subset=["_apto_key"])
-       .groupby("_apto_key", as_index=False)
-       .agg(valor_cobro_sum=("_valor_cobro_num", "sum"),
-            conteo_registros=(apto_cierre_col, "count"))
+st.set_page_config(page_title="FL Rev Confirmed Invoices", page_icon="📄")
+
+st.title("📄 FL Rev Confirmed Invoices – Processor")
+st.markdown(
+    "Sube el **CSV** exportado desde Silo (AP > Expenses) y, opcionalmente, el **consolidado** de ventas para mapear Sales Rep."
 )
 
-g2 = (
-    df2.dropna(subset=["_apto_key"])
-       .groupby("_apto_key", as_index=False)
-       .agg(nuevo_saldo_sum=("_nuevo_saldo_num", "sum"))
-)
+col1, col2 = st.columns(2)
+with col1:
+    csv_file = st.file_uploader("CSV de Expenses (ap-expenses-*.csv)", type=["csv"], accept_multiple_files=False)
+with col2:
+    consolidated_file = st.file_uploader("Consolidado (frutto_consolidated.xlsx)", type=["xlsx"], accept_multiple_files=False, help="Debe contener columnas 'Source' y 'Sales Rep'.")
 
+preview = st.checkbox("Mostrar previsualización de datos", value=False)
 
-# Agregaciones
-g1 = (
-    df1.dropna(subset=["_apto_key"])
-       .groupby("_apto_key", as_index=False)
-       .agg(valor_cobro_sum=("_valor_cobro_num", "sum"),
-            conteo_registros=(apto_cierre_col, "count"))
-)
+if st.button("Procesar", type="primary"):
+    if csv_file is None:
+        st.error("Debes subir el CSV de Expenses.")
+        st.stop()
 
-g2 = (
-    df2.dropna(subset=["_apto_key"])
-       .groupby("_apto_key", as_index=False)
-       .agg(nuevo_saldo_sum=("_nuevo_saldo_num", "sum"))
-)
+    # =========================
+    # === CARGA Y PREPRO    ===
+    # =========================
+    today = datetime.today().date()
+    dias_col_name = datetime.today().strftime("%m/%d/%y")
 
-# Join y diferencia
-res = pd.merge(g1, g2, on="_apto_key", how="outer")
-res["valor_cobro_sum"] = res["valor_cobro_sum"].fillna(0.0)
-res["nuevo_saldo_sum"] = res["nuevo_saldo_sum"].fillna(0.0)
-res["diferencia"] = res["valor_cobro_sum"] - res["nuevo_saldo_sum"]
+    try:
+        df = pd.read_csv(csv_file)
+    except Exception as e:
+        st.exception(e)
+        st.stop()
 
-# Filtrar diferencias ≠ 0 (tolerancia)
-conciliacion = res[res["diferencia"].abs() > tolerance].sort_values("_apto_key")
+    df.columns = df.columns.str.strip()
 
-# =========================
-# Resultados y descarga
-# =========================
-st.markdown("### Resultados")
-m1, m2, m3, m4 = st.columns(4)
-with m1: st.metric("Aptos en Cierre", int(g1.shape[0]))
-with m2: st.metric("Aptos en Balance", int(g2.shape[0]))
-with m3: st.metric("Coincidencias (outer join)", int(res.shape[0]))
-with m4: st.metric("Diferencias ≠ 0", int(conciliacion.shape[0]))
+    required_cols = [
+        "Requested Date",
+        "Received Date",
+        "Due Date",
+        "PO # / EXP #",
+        "Invoice Number",
+        "Vendor Name",
+        "Description",
+        "Total Amount",
+        "Buyer",
+        "Status",
+    ]
+    missing = [c for c in required_cols if c not in df.columns]
+    if missing:
+        st.error(f"Faltan columnas requeridas en el CSV: {missing}")
+        st.stop()
 
-tabs = st.tabs(["Conciliación", "Match Total", "Agregado Cierre", "Agregado Balance"])
-with tabs[0]: st.dataframe(conciliacion.reset_index(drop=True), use_container_width=True)
-with tabs[1]: st.dataframe(res.sort_values("_apto_key").reset_index(drop=True), use_container_width=True)
-with tabs[2]: st.dataframe(g1.sort_values("_apto_key").reset_index(drop=True), use_container_width=True)
-with tabs[3]: st.dataframe(g2.sort_values("_apto_key").reset_index(drop=True), use_container_width=True)
+    # Limpieza numérica
+    df["Total Amount"] = coerce_money_series(df["Total Amount"])
 
-def build_output_excel() -> bytes:
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine="xlsxwriter") as w:
-        g1.rename(columns={"_apto_key": "apto_key"}).to_excel(w, "agregado_hoja1", index=False)
-        g2.rename(columns={"_apto_key": "apto_key"}).to_excel(w, "agregado_hoja2", index=False)
-        res.rename(columns={"_apto_key": "apto_key"}).to_excel(w, "match_total", index=False)
-        conciliacion.rename(columns={"_apto_key": "apto_key"}).to_excel(w, "conciliacion", index=False)
-    return output.getvalue()
+    # 1) Parseo fechas a datetime primero (no string aún)
+    for date_col in ["Requested Date", "Received Date", "Due Date"]:
+        df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
 
-st.markdown("### Descargar resultados")
-st.download_button(
-    "Descargar Excel (agregados, match y conciliación)",
-    data=build_output_excel(),
-    file_name="conciliacion_cartera.xlsx",
-    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-)
+    # Filtro funcional: SOLO Produce y estados (paid con 0, unpaid, partially paid)
+    desc_norm = df["Description"].astype(str).str.strip().str.lower()
+    status_norm = df["Status"].astype(str).str.strip().str.lower()
 
-with st.expander("Diagnóstico (columnas detectadas)"):
-    st.json(chosen)
+    mask_produce = desc_norm == "produce"
+    mask_paid_zero = (status_norm == "paid") & (df["Total Amount"].fillna(0) == 0)
+    mask_unpaid_or_partial = status_norm.isin(["unpaid", "partially paid"])
 
-st.caption("Automático y sin selectores. Si algo no cuadra, es el 803… o la realidad 😉.")
+    df = df[mask_produce & (mask_paid_zero | mask_unpaid_or_partial)].copy()
+
+    if df.empty:
+        st.warning("El filtro no devolvió filas. Verifica el CSV o los criterios (Description='Produce').")
+        st.stop()
+
+    # Clasificación y métricas
+    df["Invoice Group"] = df["Invoice Number"].apply(classify_invoice)
+    df[dias_col_name] = df["Requested Date"].apply(lambda x: calculate_dias360(x, today))
+    df["Answer"] = ""
+
+    # No necesitamos Status en la salida
+    df.drop(columns=["Status"], inplace=True, errors="ignore")
+
+    # 2) Formateo visual de fechas (a string mm/dd/yy)
+    for date_col in ["Requested Date", "Received Date", "Due Date"]:
+        df[date_col] = df[date_col].dt.strftime("%m/%d/%y")
+
+    columns_needed = [
+        "Requested Date",
+        dias_col_name,
+        "Received Date",
+        "Due Date",
+        "PO # / EXP #",
+        "Invoice Number",
+        "Vendor Name",
+        "Description",
+        "Total Amount",
+        "Buyer",
+        "Answer",
+    ]
+    # Mantén el orden y agrega al final Invoice Group
+    df = df[[c for c in columns_needed if c in df.columns] + ["Invoice Group"]].copy()
+
+    # Mapeo de Sales Rep (opcional)
+    salesrep_map = None
+    if consolidated_file is not None:
+        try:
+            consolidated_df = pd.read_excel(consolidated_file)
+            salesrep_map = build_salesrep_lookup(consolidated_df)
+        except Exception as e:
+            st.warning(f"No se pudo construir el mapa de Sales Rep: {e}")
+            salesrep_map = None
+
+    # =========================
+    # === AGRUPACIONES      ===
+    # =========================
+    flag_mask_zero = df["Total Amount"].apply(_is_zero_amount)
+    flag_mask_class = df["Invoice Group"] == "flag_file"
+    flag_mask_pas = df["Invoice Number"].astype(str).str.contains(r"PAS", case=False, na=False)
+
+    # Nueva lógica: si es "need" y está en ceros, NO va a Flag_File
+    need_mask = df["Invoice Group"] == "need"
+    flag_union_mask = flag_mask_class | flag_mask_pas | (flag_mask_zero & ~need_mask)
+
+    groups = {
+        "Flag_File": df[flag_union_mask].copy(),
+        "Empty_or_Number": df[(df["Invoice Group"] == "empty_or_number") & (~flag_union_mask)].copy(),
+        "Need": df[(df["Invoice Group"] == "need") & (~flag_union_mask)].copy(),
+    }
+
+    # En Flag_File → Sales Rep
+    if salesrep_map is not None and not groups["Flag_File"].empty:
+        po_keys = groups["Flag_File"]["PO # / EXP #"].apply(extract_digits)
+        groups["Flag_File"]["Sales Rep"] = po_keys.map(salesrep_map).fillna("")
+        # Si existía columna Answer, la quitamos
+        if "Answer" in groups["Flag_File"].columns:
+            groups["Flag_File"].drop(columns=["Answer"], inplace=True)
+
+    # Quitar 'Answer' de hojas no-Flag_File
+    for grp_name in ["Empty_or_Number", "Need"]:
+        if not groups[grp_name].empty and "Answer" in groups[grp_name].columns:
+            groups[grp_name].drop(columns=["Answer"], inplace=True)
+
+    # =========================
+    # === EXPORTAR A EXCEL  ===
+    # =========================
+    today_str_header = datetime.today().strftime("%B %d").upper()
+    output_filename = f"FL REV CONFIRMED INVOICES {today_str_header}.xlsx"
+
+    xlsx_buffer = io.BytesIO()
+    with pd.ExcelWriter(xlsx_buffer, engine="xlsxwriter") as writer:
+        for name, sheet in groups.items():
+            sheet = sheet.drop(columns=["Invoice Group"], errors="ignore")
+            sheet.to_excel(writer, index=False, sheet_name=name)
+
+            workbook = writer.book
+            worksheet = writer.sheets[name]
+
+            date_format = workbook.add_format({"num_format": "mm/dd/yyyy"})
+            money_format_base = {"num_format": "$#,##0.00"}
+            yellow_fill = workbook.add_format({"bg_color": "#FFFF00"})
+            red_fill_white = workbook.add_format({"bg_color": "#FF0000", "font_color": "#FFFFFF"})
+            salmon_soft = workbook.add_format({"bg_color": "#FADBD8"})
+
+            formats_by_col = {}
+            for col in ["Requested Date", "Received Date", "Due Date"]:
+                if col in sheet.columns:
+                    formats_by_col[col] = date_format
+
+            _autofit_widths(worksheet, sheet, formats_by_col=formats_by_col, min_w=9, max_w=42, pad=2, ratio=1.1)
+
+            max_row, max_col = sheet.shape
+            worksheet.add_table(
+                0,
+                0,
+                max_row,
+                max_col - 1,
+                {
+                    "columns": [{"header": col} for col in sheet.columns],
+                    "style": "Table Style Light 9",
+                },
+            )
+
+            dias_col_idx = sheet.columns.get_loc(dias_col_name) if dias_col_name in sheet.columns else None
+            money_fmt_cache = {}
+
+            def get_money_format(bg_color=None, font_color=None):
+                key = (bg_color, font_color)
+                if key in money_fmt_cache:
+                    return money_fmt_cache[key]
+                base = dict(money_format_base)
+                if bg_color:
+                    base["bg_color"] = bg_color
+                if font_color:
+                    base["font_color"] = font_color
+                fmt = workbook.add_format(base)
+                money_fmt_cache[key] = fmt
+                return fmt
+
+            for row in range(1, max_row + 1):
+                dias_val = sheet.iloc[row - 1, dias_col_idx] if dias_col_idx is not None else None
+                row_bg = None
+                row_font = None
+                row_fmt = None
+
+                if name == "Need":
+                    if dias_val is not None and pd.notna(dias_val) and dias_val > 3:
+                        row_fmt = yellow_fill
+                        row_bg = "#FFFF00"
+                elif name == "Flag_File":
+                    row_fmt = red_fill_white
+                    row_bg = "#FF0000"
+                    row_font = "#FFFFFF"
+                elif name == "Empty_or_Number":
+                    if dias_val is not None and pd.notna(dias_val) and dias_val >= 3:
+                        row_fmt = yellow_fill
+                        row_bg = "#FFFF00"
+                    else:
+                        row_fmt = salmon_soft
+                        row_bg = "#FADBD8"
+
+                for col in range(len(sheet.columns)):
+                    col_name = sheet.columns[col]
+                    value = sheet.iloc[row - 1, col]
+
+                    if col_name == "Total Amount":
+                        value_num = None
+                        if pd.notna(value):
+                            try:
+                                value_num = float(value)
+                            except Exception:
+                                try:
+                                    value_num = float(re.sub(r"[^\d\.\-]", "", str(value)))
+                                except Exception:
+                                    value_num = None
+
+                        money_fmt = get_money_format(bg_color=row_bg, font_color=row_font)
+                        if value_num is None or pd.isna(value_num):
+                            worksheet.write(row, col, "", money_fmt if row_bg else row_fmt)
+                        else:
+                            worksheet.write_number(row, col, float(value_num), money_fmt)
+                    else:
+                        fmt_to_use = row_fmt
+                        if pd.isna(value):
+                            worksheet.write(row, col, "", fmt_to_use)
+                        else:
+                            worksheet.write(row, col, value, fmt_to_use)
+
+    xlsx_buffer.seek(0)
+
+    st.success("✅ Procesamiento completado.")
+
+    if preview:
+        with st.expander("Previsualizar hojas"):
+            for name, sheet in groups.items():
+                st.markdown(f"**{name}** – {len(sheet)} filas")
+                st.dataframe(sheet.head(200))
+
+    st.download_button(
+        label=f"⬇️ Descargar {output_filename}",
+        data=xlsx_buffer.getvalue(),
+        file_name=output_filename,
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+st.caption("Tip: si no subes el consolidado, la hoja 'Flag_File' no incluirá la columna 'Sales Rep'.")
