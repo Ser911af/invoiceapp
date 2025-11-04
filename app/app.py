@@ -37,6 +37,14 @@ def load_sales() -> pd.DataFrame | None:
         return None
     table_name = st.secrets.get("supabase_sales", {}).get("table", "ventas_frutto")
     try:
+        # Only fetch columns needed for mapping
+        res = sb.table(table_name).select("source,sales_rep,cus_sales_rep").limit(100000).execute()
+        rows = res.data or []
+        return pd.DataFrame(rows) if rows else None
+    except Exception:
+        return None
+    table_name = st.secrets.get("supabase_sales", {}).get("table", "ventas_frutto")
+    try:
         # Traemos sólo columnas necesarias para el mapeo
         res = sb.table(table_name).select("source,sales_rep,cus_sales_rep").execute()
         rows = res.data or []
@@ -144,14 +152,14 @@ st.set_page_config(page_title="FL Rev Confirmed Invoices", page_icon="📄")
 
 st.title("📄 FL Rev Confirmed Invoices – Processor")
 st.markdown(
-    "Sube el **CSV** exportado desde Silo (AP > Expenses). "
-    "La app buscará automáticamente el consolidado en Supabase (tabla `ventas_frutto`) "
-    "para mapear *Sales Rep*. Si no encuentra conexión/secreto, seguirá sin esa columna."
+    "Upload the **Expenses CSV** (AP > Expenses). The app will try to fetch the **sales consolidated** from **Supabase** (table `ventas_frutto`) to map the *Sales Rep*. If it can't connect, it will continue without that column."
+). La app buscará **automáticamente** el consolidado en **Supabase** (tabla `ventas_frutto`) para mapear *Sales Rep*. Si no encuentra conexión/secreto, seguirá sin esa columna."
+) y, opcionalmente, el **consolidado** de ventas para mapear Sales Rep."
 )
 
-
-csv_file = st.file_uploader("CSV de Expenses (ap-expenses-*.csv)", type=["csv"], accept_multiple_files=False)
-preview = st.checkbox("Mostrar previsualización de datos", value=False)
+csv_file = st.file_uploader("Expenses CSV (ap-expenses-*.csv)", type=["csv"], accept_multiple_files=False)
+debug_supabase = st.checkbox("Show Supabase diagnostics", value=False)
+preview = st.checkbox("Show data preview", value=False)
 
 if st.button("Procesar", type="primary"):
     if csv_file is None:
@@ -238,15 +246,24 @@ if st.button("Procesar", type="primary"):
     # Mantén el orden y agrega al final Invoice Group
     df = df[[c for c in columns_needed if c in df.columns] + ["Invoice Group"]].copy()
 
-    # Mapeo de Sales Rep desde Supabase (opcional/automático)
+    # Sales Rep mapping from Supabase (optional/automatic)
     salesrep_map = None
     sales_df = load_sales()
-    if sales_df is not None:
+    if sales_df is not None and len(sales_df) > 0:
         try:
             salesrep_map = build_salesrep_lookup(sales_df)
+            if salesrep_map:
+                st.success(f"Supabase connected • Rows: {len(sales_df):,} • Unique PO keys mapped: {len(salesrep_map):,}")
+            else:
+                st.warning("Supabase connected but no PO keys could be mapped. Ensure 'source' contains the PO/EXP number.")
+            if debug_supabase:
+                st.caption("Supabase sample (head):")
+                st.dataframe(sales_df.head(50))
         except Exception as e:
-            st.warning(f"No se pudo construir el mapa de Sales Rep desde Supabase: {e}")
+            st.warning(f"Could not build Sales Rep map from Supabase: {e}")
             salesrep_map = None
+    else:
+        st.info("Supabase not configured or returned 0 rows. Proceeding without Sales Rep column.")
 
     # =========================
     # === AGRUPACIONES      ===
@@ -400,4 +417,4 @@ if st.button("Procesar", type="primary"):
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 
-st.caption("Tip: si no subes el consolidado, la hoja 'Flag_File' no incluirá la columna 'Sales Rep'.")
+st.caption("Tip: if Supabase is not available, the 'Flag_File' sheet will not include the 'Sales Rep' column.")
