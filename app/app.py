@@ -32,25 +32,39 @@ def _load_supabase_client(secret_key: str = "supabase_sales"):
 
 @st.cache_data(ttl=300, show_spinner=False)
 def load_sales() -> pd.DataFrame | None:
-    sb = _load_supabase_client("supabase_sales")
-    if not sb:
+    """Loads the sales consolidated table from Supabase."""
+    from supabase import create_client
+
+    cfg = st.secrets.get("supabase_sales", {}) if hasattr(st, "secrets") else {}
+    url = cfg.get("url")
+    key = cfg.get("key")
+    table_name = cfg.get("table", "ventas_frutto")
+
+    if not url or not key:
+        st.error("❌ Supabase credentials missing in secrets.toml → section [supabase_sales].")
+        st.write(cfg)  # Shows what actually loaded from secrets
         return None
-    table_name = st.secrets.get("supabase_sales", {}).get("table", "ventas_frutto")
+
     try:
-        # Only fetch columns needed for mapping
-        res = sb.table(table_name).select("source,sales_rep,cus_sales_rep").limit(100000).execute()
-        rows = res.data or []
-        return pd.DataFrame(rows) if rows else None
-    except Exception:
+        sb = create_client(url, key)
+    except Exception as e:
+        st.exception(e)
+        st.error("❌ Failed to create Supabase client. Check your URL and key.")
         return None
-    table_name = st.secrets.get("supabase_sales", {}).get("table", "ventas_frutto")
+
     try:
-        # Traemos sólo columnas necesarias para el mapeo
-        res = sb.table(table_name).select("source,sales_rep,cus_sales_rep").execute()
-        rows = res.data or []
-        return pd.DataFrame(rows) if rows else None
-    except Exception:
+        res = sb.table(table_name).select("source,sales_rep,cus_sales_rep").limit(1000).execute()
+        data = res.data or []
+        if not data:
+            st.warning(f"⚠️ Connected to Supabase but no rows returned from table '{table_name}'.")
+            return None
+        st.success(f"✅ Supabase connection successful. Rows: {len(data)}")
+        return pd.DataFrame(data)
+    except Exception as e:
+        st.exception(e)
+        st.error(f"❌ Error fetching data from table '{table_name}'.")
         return None
+
 
 def classify_invoice(invoice):
     s = "" if pd.isna(invoice) else str(invoice).strip()
