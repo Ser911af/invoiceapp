@@ -4,6 +4,8 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 from datetime import datetime
+from supabase import create_client
+
 
 # =========================
 # === OPTIONAL: SUPABASE SDK PLACEHOLDER (lazy import in function)
