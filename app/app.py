@@ -252,7 +252,7 @@ if st.button("Procesar", type="primary"):
 
     # Sales Rep mapping from Supabase (optional/automatic)
     salesrep_map = None
-    def load_sales_with_diagnostics() -> pd.DataFrame | None:
+def load_sales_with_diagnostics() -> pd.DataFrame | None:
     """Loads the sales consolidated table from Supabase.
     Tries the official SDK first; falls back to REST if the SDK is not installed.
     Prints detailed diagnostics on failure.
@@ -263,12 +263,13 @@ if st.button("Procesar", type="primary"):
     table_name = cfg.get("table", "ventas_frutto")
 
     if not url or not key:
-        st.error("❌ Supabase credentials missing in secrets.toml → section [supabase_sales] (need url, key).")
-        st.write(cfg)
+        st.error("❌ Supabase credentials missing in secrets.toml → [supabase_sales] (need url, key).")
+        st.write(cfg)  # Shows what actually loaded from secrets
         return None
 
     # --- Try SDK path ---
-    if create_client is not None:
+    try:
+        from supabase import create_client  # import here to avoid ModuleNotFoundError at import time
         try:
             sb = create_client(url, key)
             res = sb.table(table_name).select("source,sales_rep,cus_sales_rep").limit(100000).execute()
@@ -281,7 +282,7 @@ if st.button("Procesar", type="primary"):
         except Exception as e:
             st.exception(e)
             st.warning("Falling back to REST API due to SDK error…")
-    else:
+    except ModuleNotFoundError:
         st.info("Supabase SDK not installed. Falling back to REST API. Add 'supabase' to requirements.txt to use SDK.")
 
     # --- REST fallback ---
@@ -289,7 +290,7 @@ if st.button("Procesar", type="primary"):
         import requests
         from urllib.parse import urljoin
 
-        rest_base = urljoin(url if url.endswith('/') else url + '/', 'rest/v1/')
+        rest_base = urljoin(url if url.endswith("/") else url + "/", "rest/v1/")
         endpoint = urljoin(rest_base, f"{table_name}")
         params = {"select": "source,sales_rep,cus_sales_rep"}
         headers = {
@@ -302,16 +303,19 @@ if st.button("Procesar", type="primary"):
         if r.status_code >= 400:
             st.error(f"❌ REST query failed ({r.status_code}): {r.text[:300]}")
             return None
+
         data = r.json()
         if not data:
             st.warning(f"⚠️ REST call succeeded but returned 0 rows from '{table_name}'.")
             return None
+
         st.success(f"✅ Supabase REST connection successful. Rows: {len(data):,}")
         return pd.DataFrame(data)
     except Exception as e:
         st.exception(e)
         st.error("❌ Could not fetch data via Supabase REST API.")
         return None
+
 
 sales_df = load_sales_with_diagnostics()
     if sales_df is not None and len(sales_df) > 0:
