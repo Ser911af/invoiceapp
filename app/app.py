@@ -144,9 +144,11 @@ st.set_page_config(page_title="FL Rev Confirmed Invoices", page_icon="📄")
 
 st.title("📄 FL Rev Confirmed Invoices – Processor")
 st.markdown(
-    "Sube el **CSV** exportado desde Silo (AP > Expenses). La app buscará **automáticamente** el consolidado en **Supabase** (tabla `ventas_frutto`) para mapear *Sales Rep*. Si no encuentra conexión/secreto, seguirá sin esa columna."
- y, opcionalmente, el **consolidado** de ventas para mapear Sales Rep."
- )
+    "Sube el **CSV** exportado desde Silo (AP > Expenses). "
+    "La app buscará automáticamente el consolidado en Supabase (tabla `ventas_frutto`) "
+    "para mapear *Sales Rep*. Si no encuentra conexión/secreto, seguirá sin esa columna."
+)
+
 
 csv_file = st.file_uploader("CSV de Expenses (ap-expenses-*.csv)", type=["csv"], accept_multiple_files=False)
 preview = st.checkbox("Mostrar previsualización de datos", value=False)
