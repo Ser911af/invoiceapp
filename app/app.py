@@ -8,17 +8,6 @@ from supabase import create_client
 
 
 # =========================
-# === OPTIONAL: SUPABASE SDK PLACEHOLDER (lazy import in function)
-# =========================
-try:
-    # We won't import here to avoid ModuleNotFoundError at import time.
-    # The real import happens inside load_sales_with_diagnostics().
-    from supabase import create_client  # type: ignore
-except Exception:
-    create_client = None  # We'll handle this in the loader function.
-
-
-# =========================
 # === UTILITIES
 # =========================
 
@@ -71,6 +60,20 @@ def extract_digits(val):
     return m.group(1) if m else None
 
 
+def normalize_po_key(val: object) -> str | None:
+    """Extract numeric PO/EXP key consistently and drop leading zeros.
+    Examples: 'PO #00123' -> '123', 'EXP-987' -> '987'."""
+    if pd.isna(val):
+        return None
+    s = str(val)
+    m = re.search(r"(\d+)", s)
+    if not m:
+        return None
+    key = m.group(1)
+    key = key.lstrip("0") or "0"
+    return key
+
+
 def build_salesrep_lookup(consolidated_df: pd.DataFrame):
     dfc = consolidated_df.copy()
     dfc.columns = dfc.columns.str.strip()
@@ -84,7 +87,7 @@ def build_salesrep_lookup(consolidated_df: pd.DataFrame):
     if not source_col or not salesrep_col:
         raise ValueError("Missing columns for mapping (expect 'source' and 'sales_rep' or 'cus_sales_rep').")
 
-    dfc["po_key"] = dfc[source_col].apply(extract_digits)
+    dfc["po_key"] = dfc[source_col].apply(normalize_po_key)
 
     def first_non_empty(s):
         for x in s:
@@ -122,12 +125,12 @@ def _autofit_widths(worksheet, df_sheet, formats_by_col=None, min_w=9, max_w=42,
 
 
 # =========================
-# === SUPABASE LOADER WITH DIAGNOSTICS (SDK + REST fallback)
+# === SUPABASE LOADER WITH PAGINATION + DIAGNOSTICS
 # =========================
 
 def load_sales_with_diagnostics() -> pd.DataFrame | None:
     """Loads the sales consolidated table from Supabase.
-    Tries the official SDK first; falls back to REST if the SDK is not installed.
+    Tries the official SDK first (with pagination); falls back to REST (also paginated).
     Prints detailed diagnostics on failure.
     """
     cfg = st.secrets.get("supabase_sales", {}) if hasattr(st, "secrets") else {}
@@ -137,53 +140,79 @@ def load_sales_with_diagnostics() -> pd.DataFrame | None:
 
     if not url or not key:
         st.error("❌ Supabase credentials missing in secrets.toml → [supabase_sales] (need url, key).")
-        st.write(cfg)  # Shows what actually loaded from secrets
+        st.write(cfg)
         return None
 
-    # --- Try SDK path (lazy import inside) ---
+    PAGE_SIZE = 2000
+
+    # --- Try SDK path (with pagination) ---
     try:
         from supabase import create_client as _create_client  # type: ignore
         try:
             sb = _create_client(url, key)
-            res = sb.table(table_name).select("source,sales_rep,cus_sales_rep").limit(100000).execute()
-            rows = res.data or []
-            if not rows:
+            all_rows = []
+            offset = 0
+            while True:
+                q = (
+                    sb.table(table_name)
+                      .select("source,sales_rep,cus_sales_rep")
+                      .range(offset, offset + PAGE_SIZE - 1)
+                )
+                res = q.execute()
+                rows = res.data or []
+                if not rows:
+                    break
+                all_rows.extend(rows)
+                if len(rows) < PAGE_SIZE:
+                    break
+                offset += PAGE_SIZE
+            if not all_rows:
                 st.warning(f"⚠️ Connected via SDK but table '{table_name}' returned 0 rows.")
                 return None
-            st.success(f"✅ Supabase SDK connection successful. Rows: {len(rows):,}")
-            return pd.DataFrame(rows)
+            st.success(f"✅ Supabase SDK connection successful. Rows: {len(all_rows):,}")
+            return pd.DataFrame(all_rows)
         except Exception as e:
             st.exception(e)
             st.warning("Falling back to REST API due to SDK error…")
     except ModuleNotFoundError:
         st.info("Supabase SDK not installed. Falling back to REST API. Add 'supabase' to requirements.txt to use SDK.")
 
-    # --- REST fallback ---
+    # --- REST fallback (with pagination) ---
     try:
         import requests
         from urllib.parse import urljoin
 
         rest_base = urljoin(url if url.endswith("/") else url + "/", "rest/v1/")
         endpoint = urljoin(rest_base, f"{table_name}")
-        params = {"select": "source,sales_rep,cus_sales_rep"}
         headers = {
             "apikey": key,
             "Authorization": f"Bearer {key}",
             "Accept": "application/json",
-            "Range": "0-99999",
+            "Prefer": "count=exact",
         }
-        r = requests.get(endpoint, headers=headers, params=params, timeout=20)
-        if r.status_code >= 400:
-            st.error(f"❌ REST query failed ({r.status_code}): {r.text[:300]}")
-            return None
-
-        data = r.json()
-        if not data:
+        all_rows = []
+        start = 0
+        while True:
+            end = start + PAGE_SIZE - 1
+            h = dict(headers)
+            h["Range"] = f"{start}-{end}"
+            params = {"select": "source,sales_rep,cus_sales_rep"}
+            r = requests.get(endpoint, headers=h, params=params, timeout=30)
+            if r.status_code >= 400:
+                st.error(f"❌ REST query failed ({r.status_code}): {r.text[:300]}")
+                return None
+            batch = r.json()
+            if not batch:
+                break
+            all_rows.extend(batch)
+            if len(batch) < PAGE_SIZE:
+                break
+            start += PAGE_SIZE
+        if not all_rows:
             st.warning(f"⚠️ REST call succeeded but returned 0 rows from '{table_name}'.")
             return None
-
-        st.success(f"✅ Supabase REST connection successful. Rows: {len(data):,}")
-        return pd.DataFrame(data)
+        st.success(f"✅ Supabase REST connection successful. Rows: {len(all_rows):,}")
+        return pd.DataFrame(all_rows)
     except Exception as e:
         st.exception(e)
         st.error("❌ Could not fetch data via Supabase REST API.")
@@ -316,7 +345,7 @@ if st.button("Process", type="primary"):
 
     # In Flag_File → Sales Rep
     if salesrep_map is not None and not groups["Flag_File"].empty:
-        po_keys = groups["Flag_File"]["PO # / EXP #"].apply(extract_digits)
+        po_keys = groups["Flag_File"]["PO # / EXP #"].apply(normalize_po_key)
         groups["Flag_File"]["Sales Rep"] = po_keys.map(salesrep_map).fillna("")
         if "Answer" in groups["Flag_File"].columns:
             groups["Flag_File"].drop(columns=["Answer"], inplace=True)
@@ -446,3 +475,4 @@ if st.button("Process", type="primary"):
     )
 
 st.caption("Tip: if Supabase is not available, the 'Flag_File' sheet will not include the 'Sales Rep' column.")
+
