@@ -9,6 +9,41 @@ from datetime import datetime
 # === UTILIDADES        ===
 # =========================
 
+# --- Supabase helpers ---
+try:
+    from supabase import create_client, Client  # type: ignore
+except Exception:
+    create_client = None
+    Client = None
+
+
+def _load_supabase_client(secret_key: str = "supabase_sales"):
+    """Crea cliente Supabase desde st.secrets[secret_key] con keys: url, key."""
+    cfg = st.secrets.get(secret_key, {}) if hasattr(st, "secrets") else {}
+    url = cfg.get("url")
+    key = cfg.get("key")
+    if not url or not key or create_client is None:
+        return None
+    try:
+        return create_client(url, key)
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def load_sales() -> pd.DataFrame | None:
+    sb = _load_supabase_client("supabase_sales")
+    if not sb:
+        return None
+    table_name = st.secrets.get("supabase_sales", {}).get("table", "ventas_frutto")
+    try:
+        # Traemos sólo columnas necesarias para el mapeo
+        res = sb.table(table_name).select("source,sales_rep,cus_sales_rep").execute()
+        rows = res.data or []
+        return pd.DataFrame(rows) if rows else None
+    except Exception:
+        return None
+
 def classify_invoice(invoice):
     s = "" if pd.isna(invoice) else str(invoice).strip()
     sl = s.lower()
@@ -60,14 +95,15 @@ def extract_digits(val):
 
 def build_salesrep_lookup(consolidated_df: pd.DataFrame):
     dfc = consolidated_df.copy()
-    dfc.columns = dfc.columns.str.strip()
+    # Normalizamos nombres de columna
+    lower_map = {c.lower(): c for c in dfc.columns}
+    source_col = lower_map.get("source") or lower_map.get("sales_order") or lower_map.get("Source")
+    salesrep_col = lower_map.get("sales_rep") or lower_map.get("cus_sales_rep") or lower_map.get("Sales Rep")
 
-    needed_cols = {"Source", "Sales Rep"}
-    missing_cols = [c for c in needed_cols if c not in dfc.columns]
-    if missing_cols:
-        raise ValueError(f"Faltan columnas en el consolidado: {missing_cols}")
+    if not source_col or not salesrep_col:
+        raise ValueError("Faltan columnas para el mapeo (se esperan 'source' y 'sales_rep' o 'cus_sales_rep').")
 
-    dfc["po_key"] = dfc["Source"].apply(extract_digits)
+    dfc["po_key"] = dfc[source_col].apply(extract_digits)
 
     def first_non_empty(s):
         for x in s:
@@ -76,10 +112,7 @@ def build_salesrep_lookup(consolidated_df: pd.DataFrame):
         return None
 
     salesrep_map = (
-        dfc.sort_values(by=["po_key"])  # asegura orden estable
-        .groupby("po_key", dropna=True)["Sales Rep"]
-        .apply(first_non_empty)
-        .to_dict()
+        dfc.sort_values(by=["po_key"]).groupby("po_key", dropna=True)[salesrep_col].apply(first_non_empty).to_dict()
     )
     return {k: v for k, v in salesrep_map.items() if k}
 
@@ -111,15 +144,11 @@ st.set_page_config(page_title="FL Rev Confirmed Invoices", page_icon="📄")
 
 st.title("📄 FL Rev Confirmed Invoices – Processor")
 st.markdown(
-    "Sube el **CSV** exportado desde Silo (AP > Expenses) y, opcionalmente, el **consolidado** de ventas para mapear Sales Rep."
+    "Sube el **CSV** exportado desde Silo (AP > Expenses). La app buscará **automáticamente** el consolidado en **Supabase** (tabla `ventas_frutto`) para mapear *Sales Rep*. Si no encuentra conexión/secreto, seguirá sin esa columna."
+) y, opcionalmente, el **consolidado** de ventas para mapear Sales Rep."
 )
 
-col1, col2 = st.columns(2)
-with col1:
-    csv_file = st.file_uploader("CSV de Expenses (ap-expenses-*.csv)", type=["csv"], accept_multiple_files=False)
-with col2:
-    consolidated_file = st.file_uploader("Consolidado (frutto_consolidated.xlsx)", type=["xlsx"], accept_multiple_files=False, help="Debe contener columnas 'Source' y 'Sales Rep'.")
-
+csv_file = st.file_uploader("CSV de Expenses (ap-expenses-*.csv)", type=["csv"], accept_multiple_files=False)
 preview = st.checkbox("Mostrar previsualización de datos", value=False)
 
 if st.button("Procesar", type="primary"):
@@ -207,14 +236,14 @@ if st.button("Procesar", type="primary"):
     # Mantén el orden y agrega al final Invoice Group
     df = df[[c for c in columns_needed if c in df.columns] + ["Invoice Group"]].copy()
 
-    # Mapeo de Sales Rep (opcional)
+    # Mapeo de Sales Rep desde Supabase (opcional/automático)
     salesrep_map = None
-    if consolidated_file is not None:
+    sales_df = load_sales()
+    if sales_df is not None:
         try:
-            consolidated_df = pd.read_excel(consolidated_file)
-            salesrep_map = build_salesrep_lookup(consolidated_df)
+            salesrep_map = build_salesrep_lookup(sales_df)
         except Exception as e:
-            st.warning(f"No se pudo construir el mapa de Sales Rep: {e}")
+            st.warning(f"No se pudo construir el mapa de Sales Rep desde Supabase: {e}")
             salesrep_map = None
 
     # =========================
