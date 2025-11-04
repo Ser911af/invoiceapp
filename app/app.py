@@ -32,39 +32,25 @@ def _load_supabase_client(secret_key: str = "supabase_sales"):
 
 @st.cache_data(ttl=300, show_spinner=False)
 def load_sales() -> pd.DataFrame | None:
-    """Loads the sales consolidated table from Supabase."""
-    from supabase import create_client
-
-    cfg = st.secrets.get("supabase_sales", {}) if hasattr(st, "secrets") else {}
-    url = cfg.get("url")
-    key = cfg.get("key")
-    table_name = cfg.get("table", "ventas_frutto")
-
-    if not url or not key:
-        st.error("❌ Supabase credentials missing in secrets.toml → section [supabase_sales].")
-        st.write(cfg)  # Shows what actually loaded from secrets
+    sb = _load_supabase_client("supabase_sales")
+    if not sb:
         return None
-
+    table_name = st.secrets.get("supabase_sales", {}).get("table", "ventas_frutto")
     try:
-        sb = create_client(url, key)
-    except Exception as e:
-        st.exception(e)
-        st.error("❌ Failed to create Supabase client. Check your URL and key.")
+        # Only fetch columns needed for mapping
+        res = sb.table(table_name).select("source,sales_rep,cus_sales_rep").limit(100000).execute()
+        rows = res.data or []
+        return pd.DataFrame(rows) if rows else None
+    except Exception:
         return None
-
+    table_name = st.secrets.get("supabase_sales", {}).get("table", "ventas_frutto")
     try:
-        res = sb.table(table_name).select("source,sales_rep,cus_sales_rep").limit(1000).execute()
-        data = res.data or []
-        if not data:
-            st.warning(f"⚠️ Connected to Supabase but no rows returned from table '{table_name}'.")
-            return None
-        st.success(f"✅ Supabase connection successful. Rows: {len(data)}")
-        return pd.DataFrame(data)
-    except Exception as e:
-        st.exception(e)
-        st.error(f"❌ Error fetching data from table '{table_name}'.")
+        # Traemos sólo columnas necesarias para el mapeo
+        res = sb.table(table_name).select("source,sales_rep,cus_sales_rep").execute()
+        rows = res.data or []
+        return pd.DataFrame(rows) if rows else None
+    except Exception:
         return None
-
 
 def classify_invoice(invoice):
     s = "" if pd.isna(invoice) else str(invoice).strip()
@@ -266,7 +252,68 @@ if st.button("Procesar", type="primary"):
 
     # Sales Rep mapping from Supabase (optional/automatic)
     salesrep_map = None
-    sales_df = load_sales()
+    def load_sales_with_diagnostics() -> pd.DataFrame | None:
+    """Loads the sales consolidated table from Supabase.
+    Tries the official SDK first; falls back to REST if the SDK is not installed.
+    Prints detailed diagnostics on failure.
+    """
+    cfg = st.secrets.get("supabase_sales", {}) if hasattr(st, "secrets") else {}
+    url = cfg.get("url")
+    key = cfg.get("key")
+    table_name = cfg.get("table", "ventas_frutto")
+
+    if not url or not key:
+        st.error("❌ Supabase credentials missing in secrets.toml → section [supabase_sales] (need url, key).")
+        st.write(cfg)
+        return None
+
+    # --- Try SDK path ---
+    if create_client is not None:
+        try:
+            sb = create_client(url, key)
+            res = sb.table(table_name).select("source,sales_rep,cus_sales_rep").limit(100000).execute()
+            rows = res.data or []
+            if not rows:
+                st.warning(f"⚠️ Connected via SDK but table '{table_name}' returned 0 rows.")
+                return None
+            st.success(f"✅ Supabase SDK connection successful. Rows: {len(rows):,}")
+            return pd.DataFrame(rows)
+        except Exception as e:
+            st.exception(e)
+            st.warning("Falling back to REST API due to SDK error…")
+    else:
+        st.info("Supabase SDK not installed. Falling back to REST API. Add 'supabase' to requirements.txt to use SDK.")
+
+    # --- REST fallback ---
+    try:
+        import requests
+        from urllib.parse import urljoin
+
+        rest_base = urljoin(url if url.endswith('/') else url + '/', 'rest/v1/')
+        endpoint = urljoin(rest_base, f"{table_name}")
+        params = {"select": "source,sales_rep,cus_sales_rep"}
+        headers = {
+            "apikey": key,
+            "Authorization": f"Bearer {key}",
+            "Accept": "application/json",
+            "Range": "0-99999",
+        }
+        r = requests.get(endpoint, headers=headers, params=params, timeout=20)
+        if r.status_code >= 400:
+            st.error(f"❌ REST query failed ({r.status_code}): {r.text[:300]}")
+            return None
+        data = r.json()
+        if not data:
+            st.warning(f"⚠️ REST call succeeded but returned 0 rows from '{table_name}'.")
+            return None
+        st.success(f"✅ Supabase REST connection successful. Rows: {len(data):,}")
+        return pd.DataFrame(data)
+    except Exception as e:
+        st.exception(e)
+        st.error("❌ Could not fetch data via Supabase REST API.")
+        return None
+
+sales_df = load_sales_with_diagnostics()
     if sales_df is not None and len(sales_df) > 0:
         try:
             salesrep_map = build_salesrep_lookup(sales_df)
